@@ -38,9 +38,9 @@ namespace WebServer {
       WriteHandler&& handler)
     {
       const auto buffersSize = boost::asio::buffer_size(buffers);
-      boost::asio::buffer_copy(body().streambuf.prepare(buffersSize), buffers);
-      body().streambuf.commit(buffersSize);
       BOOST_LOG_TRIVIAL(info) << "async_write_some " << buffersSize;
+      for (const auto& buffer : buffers)
+        body().buffers.emplace_back(buffer);
     
       async_write(
         *stream_,
@@ -48,7 +48,7 @@ namespace WebServer {
         [=, handler = std::forward<WriteHandler>(handler)](boost::system::error_code ec, std::size_t size) mutable {
           BOOST_LOG_TRIVIAL(info) << "async_write_some handler " << ec.message() << " " << size;
           if (!ec || ec == boost::beast::http::error::need_buffer) {
-            body().streambuf.consume(buffersSize);
+            body().buffers.clear();
             ec = {};
           }
           handler(ec, size);
@@ -102,13 +102,14 @@ namespace WebServer {
       boost::system::error_code & ec)
     {
       const auto buffersSize = boost::asio::buffer_size(buffers);
-      boost::asio::buffer_copy(body().streambuf.prepare(buffersSize), buffers);
-      body().streambuf.commit(buffersSize);
       BOOST_LOG_TRIVIAL(info) << "write_some " << buffersSize;
+      for (const auto& buffer : buffers)
+        body().buffers.emplace_back(buffer);
+    
 
       const auto size = write(*stream_, serializer_, ec);
       if (!ec || ec == boost::beast::http::error::need_buffer) {
-        body().streambuf.consume(buffersSize);
+        body().buffers.clear();
         ec = {};
       }
       return buffersSize;
@@ -138,10 +139,16 @@ namespace WebServer {
     }
 
     void handleAccept(const std::shared_ptr<boost::asio::ip::tcp::socket>& socket) {
-      BOOST_LOG_TRIVIAL(info) << "handleAccept";
       doAccept();
 
-      BOOST_LOG_TRIVIAL(info) << "Session created";
+      boost::system::error_code ec;
+      auto endpoint = socket->remote_endpoint(ec);
+      if (!ec) {
+        BOOST_LOG_TRIVIAL(info) << "Accepting connection from " << endpoint.address().to_string();
+      }
+      else
+        fail(ec, "remote endpoint");
+      
       doRead(socket, std::make_shared<boost::beast::flat_buffer>());
     }
 
@@ -202,8 +209,11 @@ namespace WebServer {
     }
 
     void doClose(const std::shared_ptr<boost::asio::ip::tcp::socket>& socket) const {
-      BOOST_LOG_TRIVIAL(info) << "doClose";
       boost::system::error_code ec;
+      auto endpoint = socket->remote_endpoint(ec);
+      if (!ec) {
+        BOOST_LOG_TRIVIAL(info) << "Closing connection from " << endpoint.address().to_string();
+      }
       socket->shutdown(boost::asio::ip::tcp::socket::shutdown_send, ec);
     }
     
@@ -244,7 +254,7 @@ namespace WebServer {
       response.set(boost::beast::http::field::content_type, "text/plain");
       async_write(
         response,
-        boost::asio::buffer(std::string("how now brown cow")),
+        boost::asio::buffer("how now brown cow", 17),
         [=](const boost::system::error_code& ec, size_t size) {
           BOOST_LOG_TRIVIAL(info) << "async_write handler " << ec.message() << " " << size;
           handler(ec);
