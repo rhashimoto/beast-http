@@ -1,6 +1,6 @@
 
 namespace WebServer {
-  template<typename Stream> class Response;
+  class Response;
   
   namespace detail {
     struct ResponseBody {
@@ -14,7 +14,7 @@ namespace WebServer {
           : more(true) {
         }
 
-        template<typename T> friend class WebServer::Response;
+        friend class WebServer::Response;
         friend class ResponseBody::reader;
       };
   
@@ -55,6 +55,44 @@ namespace WebServer {
           return std::pair<const_buffers_type, bool>(value_.buffers, value_.more);
         }
       };
+    };
+
+    struct ConstBufferContainer : public std::vector<boost::asio::const_buffer> {
+      ConstBufferContainer() = default;
+
+      template<typename T>
+      ConstBufferContainer(const T& buffers) {
+        for (const auto& buffer : buffers)
+          emplace_back(buffer);
+      }
+    };
+    
+    struct StreamFacade {
+      virtual boost::asio::io_service& get_io_service() = 0;
+      virtual void async_write_some(
+        ConstBufferContainer buffers,
+        std::function<void(const boost::system::error_code&, std::size_t)> handler) = 0;
+    };
+
+    template<typename StreamType>
+    class StreamFacadeT : public StreamFacade {
+      StreamType& stream_;
+    public:
+      StreamFacadeT(StreamType& stream)
+        : stream_(stream)
+      {
+      }
+
+      virtual boost::asio::io_service& get_io_service() {
+        return stream_.get_io_service();
+      }
+
+      virtual void async_write_some(
+        ConstBufferContainer buffers,
+        std::function<void(const boost::system::error_code&, std::size_t)> handler)
+      {
+        stream_.async_write_some(std::move(buffers), std::move(handler));
+      }
     };
   }
 }

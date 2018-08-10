@@ -15,15 +15,15 @@ namespace WebServer {
   typedef boost::beast::http::request<boost::beast::http::string_body> StringRequest;
 
   // Response with AsyncWriteStream and SyncWriteStream support.
-  template<typename Stream>
   class Response : public boost::beast::http::response<detail::ResponseBody> {
-    std::shared_ptr<Stream> stream_;
+    std::unique_ptr<detail::StreamFacade> stream_;
     boost::beast::http::response_serializer<body_type, fields_type> serializer_;
 
   public:
-    Response(const std::shared_ptr<Stream>& stream)
+    template<typename Stream>
+    Response(Stream& stream)
       : boost::beast::http::response<detail::ResponseBody>()
-      , stream_(stream)
+      , stream_(new detail::StreamFacadeT<Stream>(stream))
       , serializer_(*this) {
     }
 
@@ -45,7 +45,7 @@ namespace WebServer {
       async_write(
         *stream_,
         serializer_,
-        [=, handler = std::forward<WriteHandler>(handler)](boost::system::error_code ec, std::size_t size) mutable {
+        [=](boost::system::error_code ec, std::size_t size) mutable {
           BOOST_LOG_TRIVIAL(info) << "async_write_some handler " << ec.message() << " " << size;
           if (!ec || ec == boost::beast::http::error::need_buffer) {
             body().buffers.clear();
@@ -74,17 +74,12 @@ namespace WebServer {
       async_write(
         *stream_,
         serializer_, 
-        [this, handler](boost::system::error_code ec, std::size_t size) mutable {
+        [=](boost::system::error_code ec, std::size_t size) mutable {
           BOOST_LOG_TRIVIAL(info) << "async_finish handler " << size;
           handler(ec);
         });
     
       return result.get();
-    }
-
-    template<typename Token>
-    friend auto async_finish(Response& response, Token&& token) {
-      return response.async_finish(std::forward<Token>(token));
     }
 
     template<typename ConstBufferSequence>
@@ -126,14 +121,12 @@ namespace WebServer {
     }
     
     void doAccept() {
-      BOOST_LOG_TRIVIAL(info) << "doAccept";
       auto socket = std::make_shared<boost::asio::ip::tcp::socket>(io_);
       acceptor_.async_accept(
         *socket,
-        [this, socket](const boost::system::error_code& ec) mutable {
-          BOOST_LOG_TRIVIAL(info) << "doAccept handler";
+        [=](const boost::system::error_code& ec) mutable {
           if (ec)
-            return fail(ec, "async_accept");
+            return fail(ec, "socket accept");
           handleAccept(socket);
         });
     }
@@ -144,7 +137,9 @@ namespace WebServer {
       boost::system::error_code ec;
       auto endpoint = socket->remote_endpoint(ec);
       if (!ec) {
-        BOOST_LOG_TRIVIAL(info) << "Accepting connection from " << endpoint.address().to_string();
+        BOOST_LOG_TRIVIAL(info) << boost::format("%x Accepting %s")
+          % socket.get()
+          % endpoint.address().to_string();
       }
       else
         fail(ec, "remote endpoint");
@@ -157,15 +152,13 @@ namespace WebServer {
       const std::shared_ptr<Stream>& stream,
       const std::shared_ptr<boost::beast::flat_buffer>& buffer) const
     {
-      BOOST_LOG_TRIVIAL(info) << "doRead";
       auto request = std::make_shared<Request>();
       boost::beast::http::async_read(
         *stream, *buffer, *request,
-        [this, stream, buffer, request](const boost::system::error_code& ec, size_t) {
-          BOOST_LOG_TRIVIAL(info) << "async_read handler " << ec.message();
+        [=](const boost::system::error_code& ec, size_t) {
           if (ec) {
             if (ec != boost::beast::http::error::end_of_stream)
-              fail(ec, "async_read");
+              fail(ec, "request");
             return doClose(stream);
           }
           handleRead(stream, buffer, request);
@@ -178,10 +171,13 @@ namespace WebServer {
       const std::shared_ptr<boost::beast::flat_buffer>& buffer,
       const std::shared_ptr<Request>& request) const
     {
-      BOOST_LOG_TRIVIAL(info) << "handleRead";
       doRead(stream, buffer);
 
-      auto response = std::make_shared<Response<Stream>>(stream);
+      BOOST_LOG_TRIVIAL(info) << boost::format("%x %s %s")
+        % stream.get()
+        % request->method_string()
+        % request->target();
+      auto response = std::make_shared<Response>(*stream);
       response->version(request->version());
       response->set(boost::beast::http::field::server, BOOST_BEAST_VERSION_STRING);
       response->keep_alive(request->keep_alive());
@@ -189,22 +185,21 @@ namespace WebServer {
 
       doResponse(
         *request, *response,
-        [this, request, response](const boost::system::error_code& ec) {
-          BOOST_LOG_TRIVIAL(info) << "doResponse handler";
+        [=](const boost::system::error_code& ec) {
+          boost::ignore_unused(request);
           if (ec)
-            fail(ec, "doResponse");
+            fail(ec, "user handler");
           handleResponse(response);
         });
     }
 
-    template<typename Stream>
-    void handleResponse(const std::shared_ptr<Response<Stream>>& response) const {
-      BOOST_LOG_TRIVIAL(info) << "handleResponse";
+    void handleResponse(const std::shared_ptr<Response>& response) const {
       response->async_finish(
-        [this, response](const boost::system::error_code& ec) {
+        [=](const boost::system::error_code& ec) {
+          boost::ignore_unused(response);
           BOOST_LOG_TRIVIAL(info) << "async_finish handler " << ec.message();
           if (ec)
-            fail(ec, "async_finish");
+            fail(ec, "response completion");
         });
     }
 
@@ -212,8 +207,14 @@ namespace WebServer {
       boost::system::error_code ec;
       auto endpoint = socket->remote_endpoint(ec);
       if (!ec) {
-        BOOST_LOG_TRIVIAL(info) << "Closing connection from " << endpoint.address().to_string();
+        BOOST_LOG_TRIVIAL(info) << boost::format("%x Closing %s ")
+          % socket.get()
+          % endpoint.address().to_string();
       }
+      else {
+        fail(ec, "remote endpoint");
+      }
+        
       socket->shutdown(boost::asio::ip::tcp::socket::shutdown_send, ec);
     }
     
@@ -246,19 +247,11 @@ namespace WebServer {
 
     virtual void doResponse(
       const Request& request,
-      WebServer::Response<boost::asio::ip::tcp::socket>& response,
+      WebServer::Response& response,
       const std::function<void(const boost::system::error_code& ec)>& handler) const
     {
-      BOOST_LOG_TRIVIAL(info) << "doResponse";
-      response.result(boost::beast::http::status::ok);
-      response.set(boost::beast::http::field::content_type, "text/plain");
-      async_write(
-        response,
-        boost::asio::buffer("how now brown cow", 17),
-        [=](const boost::system::error_code& ec, size_t size) {
-          BOOST_LOG_TRIVIAL(info) << "async_write handler " << ec.message() << " " << size;
-          handler(ec);
-        });
+      response.result(boost::beast::http::status::not_found);
+      handler(boost::system::error_code());
     }
   };
 
