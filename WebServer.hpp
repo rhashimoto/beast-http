@@ -74,6 +74,8 @@ namespace WebServer {
       return result;
     } 
   };
+
+  typedef Parser::value_type Request;
   
   // Response with AsyncWriteStream and SyncWriteStream support.
   class Response : public boost::beast::http::response<detail::ResponseBody> {
@@ -329,13 +331,62 @@ namespace WebServer {
     virtual void stop() {
     }
 
+    // Override this function to control reading the request body.
+    // This default implementation reads the entire body and attaches
+    // it to the request as a string.
     virtual void doResponse(
       Parser& parser,
       Response& response,
       const std::function<void(const boost::system::error_code& ec)>& handler) const
     {
-      response.result(boost::beast::http::status::not_found);
-      handler(boost::system::error_code());
+      static const size_t CHUNK_SIZE = 8192;
+      static const size_t MAX_BODY_SIZE = 1048576;
+      
+      Request& request = parser.get();
+      if (!parser.is_done()) {
+        auto v = std::make_shared<std::vector<char>>(
+          std::min(MAX_BODY_SIZE - request.body().size(), CHUNK_SIZE));
+        async_read(
+          parser, boost::asio::buffer(*v),
+          [=, &parser, &request, &response](const boost::system::error_code& ec, std::size_t size) mutable {
+            // Work around https://github.com/boostorg/beast/issues/1223
+            size = ec == boost::beast::http::error::need_buffer ? v->size() : size;
+
+            request.body().insert(request.body().end(), v->begin(), v->begin() + size);
+            if (request.body().size() < MAX_BODY_SIZE) {
+              doResponse(parser, response, handler);
+            }
+            else {
+              if (!parser.is_done()) {
+                BOOST_LOG_TRIVIAL(warning) << boost::format("Body truncated to %d bytes")
+                  % request.body().size();
+              }
+              doResponse(request, response, handler);
+            }
+          });
+        return;
+      }
+
+      doResponse(request, response, handler);
+    }
+
+    // Override this function to get the request body as a string.
+    virtual void doResponse(
+      const Request& request,
+      Response& response,
+      const std::function<void(const boost::system::error_code& ec)>& handler) const
+    {
+      BOOST_LOG_TRIVIAL(info) << request.body();
+      
+      response.result(boost::beast::http::status::ok);
+
+      auto body = std::make_shared<std::string>("Hello, world!");
+      async_write(
+        response, boost::asio::buffer(*body),
+        [=](const boost::system::error_code& ec, std::size_t) {
+          boost::ignore_unused(body);
+          handler(ec);
+        });
     }
   };
 

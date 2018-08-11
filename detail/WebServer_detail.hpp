@@ -10,7 +10,7 @@ namespace WebServer {
 #else
       class writer;
 #endif
-      class value_type {
+      class value_type : public std::string {
         std::vector<boost::asio::mutable_buffer> buffers;
 
         // BodyReader/BodyWriter were reversed @ Boost 1.66.
