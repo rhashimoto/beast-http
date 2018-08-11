@@ -406,31 +406,137 @@ namespace WebServer {
       return buffersSize;
     }
   };
-  
-  class BasicServer {
-    static const std::size_t FLUSH_BLOCK_SIZE = 16384;
+
+  template<typename Stream>
+  class Session {
+  public:
+    typedef std::function<void (const boost::system::error_code&)> CompletionHandler;
+    typedef std::function<void (Parser&, Response&, const CompletionHandler&)> RequestHandler;
+
+    Session(Stream& stream)
+      : stream_(stream)
+      , flushBufferBytes_(DEFAULT_FLUSH_BUFFER_BYTES) {
+    }
+
+    void start(RequestHandler handle, CompletionHandler complete) {
+      handle_ = std::move(handle);
+      complete_ = std::move(complete);
+      beginTransaction();
+    }
+
+  private:
+    static const std::size_t DEFAULT_FLUSH_BUFFER_BYTES = 8192;
     
-    boost::asio::io_service& io_;
-    boost::asio::ip::tcp::acceptor acceptor_;
+    Stream& stream_;
+    boost::beast::flat_buffer parseBuffer_;
+    
+    RequestHandler handle_;
+    CompletionHandler complete_;
+
+    std::size_t flushBufferBytes_;
+    
+    void beginTransaction() {
+      auto parser = std::make_shared<Parser>(stream_, parseBuffer_);
+      boost::beast::http::async_read_header(
+        stream_, parseBuffer_, *parser,
+        [=](const boost::system::error_code& ec, size_t) mutable {
+          if (ec) {
+            if (ec != boost::beast::http::error::end_of_stream)
+              fail(ec, "parse header");
+            return close(ec);
+          }
+          invokeHandler(parser);
+        });
+    }
+
+    void invokeHandler(const std::shared_ptr<Parser>& parser) {
+      BOOST_LOG_TRIVIAL(info) << boost::format("%x %s %s")
+        % &stream_
+        % parser->get().method_string()
+        % parser->get().target();
+      auto response = std::make_shared<Response>(stream_);
+      response->version(parser->get().version());
+      response->set(boost::beast::http::field::server, BOOST_BEAST_VERSION_STRING);
+      response->keep_alive(parser->get().keep_alive());
+      response->prepare_payload();
+
+      handle_(
+        *parser, *response,
+        [=](const boost::system::error_code& ec) mutable {
+          if (ec) {
+            fail(ec, "user handler");
+            return close(ec);
+          }
+          endTransaction(parser, response);
+        });
+    }
+
+    void endTransaction(
+      const std::shared_ptr<Parser>& parser,
+      const std::shared_ptr<Response>& response)
+    {
+      if (!parser->is_done()) {
+        static std::vector<char> flushBuffer;
+        flushBuffer.resize(flushBufferBytes_);
+        
+        return async_read(
+          *parser, boost::asio::buffer(flushBuffer),
+          [=](const boost::system::error_code& ec, std::size_t size) mutable {
+            if (!ec ||
+                ec == boost::beast::http::error::need_buffer ||
+                ec == boost::asio::error::eof) {
+              endTransaction(parser, response);
+            }
+            else {
+              fail(ec, "parser flush");
+              close(ec);
+            }
+          });
+      }
+      
+      response->async_finish(
+        [=](const boost::system::error_code& ec) mutable {
+          boost::ignore_unused(response);
+          if (ec)
+            fail(ec, "response completion");
+          beginTransaction();
+        });
+    }
+    
+    void close(const boost::system::error_code& ec) {
+      complete_(ec);
+    }
 
     void fail(const boost::system::error_code& ec, const std::string& context) const {
       BOOST_LOG_TRIVIAL(error) << context << ": " << ec.message();
     }
     
-    void doAccept() {
-      auto socket = std::make_shared<boost::asio::ip::tcp::socket>(io_);
+  };
+      
+  class BasicServer {
+    static const std::size_t FLUSH_BUFFER_SIZE = 16384;
+    
+    boost::asio::io_service& io_;
+    boost::asio::ip::tcp::acceptor acceptor_;
+
+    typedef boost::asio::ip::tcp::socket Stream;
+    
+    void beginConnection() {
+      auto socket = std::make_shared<Stream>(io_);
       acceptor_.async_accept(
         *socket,
         [=](const boost::system::error_code& ec) mutable {
-          if (ec)
-            return fail(ec, "socket accept");
-          handleAccept(socket);
+          if (ec) {
+            BOOST_LOG_TRIVIAL(info) << boost::format("%x Socket error: %s ")
+              % socket.get()
+              % ec.message();
+            return;
+          }
+          createSession(socket);
         });
     }
 
-    void handleAccept(const std::shared_ptr<boost::asio::ip::tcp::socket>& socket) {
-      doAccept();
-
+    void createSession(const std::shared_ptr<Stream>& socket) {
       boost::system::error_code ec;
       auto endpoint = socket->remote_endpoint(ec);
       if (!ec) {
@@ -438,90 +544,24 @@ namespace WebServer {
           % socket.get()
           % endpoint.address().to_string();
       }
-      else
-        fail(ec, "remote endpoint");
-      
-      doRead(socket, std::make_shared<boost::beast::flat_buffer>());
-    }
-
-    template<typename Stream>
-    void doRead(
-      const std::shared_ptr<Stream>& stream,
-      const std::shared_ptr<boost::beast::flat_buffer>& buffer) const
-    {
-      auto parser = std::make_shared<Parser>(*stream, *buffer);
-      boost::beast::http::async_read_header(
-        *stream, *buffer, *parser,
-        [=](const boost::system::error_code& ec, size_t) {
-          if (ec) {
-            if (ec != boost::beast::http::error::end_of_stream)
-              fail(ec, "parse header");
-            return doClose(stream);
-          }
-          handleRead(stream, buffer, parser);
-        });
-    }
-
-    template<typename Stream>
-    void handleRead(
-      const std::shared_ptr<Stream>& stream,
-      const std::shared_ptr<boost::beast::flat_buffer>& buffer,
-      const std::shared_ptr<Parser>& parser) const
-    {
-      BOOST_LOG_TRIVIAL(info) << boost::format("%x %s %s")
-        % stream.get()
-        % parser->get().method_string()
-        % parser->get().target();
-      auto response = std::make_shared<Response>(*stream);
-      response->version(parser->get().version());
-      response->set(boost::beast::http::field::server, BOOST_BEAST_VERSION_STRING);
-      response->keep_alive(parser->get().keep_alive());
-      response->prepare_payload();
-
-      doResponse(
-        *parser, *response,
-        [=](const boost::system::error_code& ec) {
-          if (ec)
-            fail(ec, "user handler");
-          handleResponse(stream, buffer, parser, response);
-        });
-    }
-
-    template<typename Stream>
-    void handleResponse(
-      const std::shared_ptr<Stream>& stream,
-      const std::shared_ptr<boost::beast::flat_buffer>& buffer,
-      const std::shared_ptr<Parser>& parser,
-      const std::shared_ptr<Response>& response) const {
-
-      if (!parser->is_done()) {
-        static std::vector<char> flushBuffer(FLUSH_BLOCK_SIZE);
-        async_read(
-          *parser, boost::asio::buffer(flushBuffer),
-          [=](const boost::system::error_code& ec, std::size_t size) {
-            if (!ec ||
-                ec == boost::beast::http::error::need_buffer ||
-                ec == boost::asio::error::eof) {
-              handleResponse(stream, buffer, parser, response);
-            }
-            else {
-              fail(ec, "parser flush");
-            }
-          });
-        return;
+      else {
+        return endConnection(socket);
       }
-      
-      response->async_finish(
-        [=](const boost::system::error_code& ec) {
-          boost::ignore_unused(response);
-          if (ec)
-            fail(ec, "response completion");
-        });
 
-      doRead(stream, buffer);
+      beginConnection();
+      auto session = std::make_shared<Session<Stream>>(*socket);
+      session->start(
+        [=](Parser& parser, Response& response, const Session<Stream>::CompletionHandler& complete) mutable {
+          handleRequest(parser, response, complete);
+        },
+        [=](const boost::system::error_code& ec) mutable {
+          // TODO: Do something on error?
+          boost::ignore_unused(session);
+          endConnection(socket);
+        });
     }
 
-    void doClose(const std::shared_ptr<boost::asio::ip::tcp::socket>& socket) const {
+    void endConnection(const std::shared_ptr<Stream>& socket) {
       boost::system::error_code ec;
       auto endpoint = socket->remote_endpoint(ec);
       if (!ec) {
@@ -530,12 +570,14 @@ namespace WebServer {
           % endpoint.address().to_string();
       }
       else {
-        fail(ec, "remote endpoint");
+        BOOST_LOG_TRIVIAL(error) << boost::format("%x Invalid endpoint: %s")
+          % socket.get()
+          % ec.message();
       }
         
-      socket->shutdown(boost::asio::ip::tcp::socket::shutdown_send, ec);
+      socket->shutdown(Stream::shutdown_send, ec);
     }
-    
+
   public:
     BasicServer(boost::asio::io_service& io)
       : io_(io)
@@ -557,7 +599,7 @@ namespace WebServer {
         % address
         % port;
 
-      doAccept();
+      beginConnection();
     }
 
     virtual void stop() {
@@ -566,7 +608,7 @@ namespace WebServer {
     // Override this function to control reading the request body.
     // This default implementation reads the entire body and attaches
     // it to the request as a string.
-    virtual void doResponse(
+    virtual void handleRequest(
       Parser& parser,
       Response& response,
       const std::function<void(const boost::system::error_code& ec)>& complete) const
@@ -586,24 +628,24 @@ namespace WebServer {
 
             request.body().insert(request.body().end(), v->begin(), v->begin() + size);
             if (request.body().size() < MAX_BODY_SIZE) {
-              doResponse(parser, response, complete);
+              handleRequest(parser, response, complete);
             }
             else {
               if (!parser.is_done()) {
                 BOOST_LOG_TRIVIAL(warning) << boost::format("Body truncated to %d bytes")
                   % request.body().size();
               }
-              doResponse(request, response, complete);
+              handleRequest(request, response, complete);
             }
           });
         return;
       }
 
-      doResponse(request, response, complete);
+      handleRequest(request, response, complete);
     }
 
     // Override this function to get the request body as a string.
-    virtual void doResponse(
+    virtual void handleRequest(
       const Request& request,
       Response& response,
       const std::function<void(const boost::system::error_code& ec)>& complete) const

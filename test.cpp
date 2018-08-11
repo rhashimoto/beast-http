@@ -4,18 +4,20 @@ struct MyWebServer : public WebServer::BasicServer {
   MyWebServer(boost::asio::io_service& io)
     : WebServer::BasicServer(io) {}
   
-  virtual void doResponse(
-    WebServer::Parser& parser,
+  virtual void handleRequest(
+    const WebServer::Request& request,
     WebServer::Response& response,
     const std::function<void(const boost::system::error_code& ec)>& complete) const
     {
+      if (!request.body().empty())
+        BOOST_LOG_TRIVIAL(info) << "request payload: " << request.body();
+      
       response.result(boost::beast::http::status::ok);
       response.set(boost::beast::http::field::content_type, "text/plain");
       async_write(
         response,
         boost::asio::buffer("how now brown cow", 17),
         [=](const boost::system::error_code& ec, size_t size) {
-          BOOST_LOG_TRIVIAL(info) << "async_write handler " << ec.message() << " " << size;
           complete(ec);
         });
     }
