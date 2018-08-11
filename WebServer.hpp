@@ -1,8 +1,6 @@
 #ifndef WebServer_H_
 #define WebServer_H_
 
-#include <chrono>
-#include <thread>
 #include <boost/asio/io_service.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/read.hpp>
@@ -11,10 +9,253 @@
 #include <boost/format.hpp>
 #include <boost/log/trivial.hpp>
 
-#include "detail/WebServer_detail.hpp"
-
 namespace WebServer {
+  class Parser;
+  class Response;
+  namespace detail {
+    struct RequestBody {
+#if BOOST_VERSION >= 106600
+      class reader;
+#else
+      class writer;
+#endif
+      class value_type : public std::string {
+        std::vector<boost::asio::mutable_buffer> buffers;
+        
+        // BodyReader/BodyWriter were reversed @ Boost 1.66.
+#if BOOST_VERSION >= 106600
+        friend class RequestBody::reader;
+#else
+        friend class RequestBody::writer;
+#endif
+        friend class WebServer::Parser;
+      };
+
+      // BodyReader/BodyWriter were reversed @ Boost 1.66.
+#if BOOST_VERSION >= 106600
+      class reader {
+#else
+      class writer {
+#endif
+        value_type& value_;
+      public:
+        template<bool isRequest, class Fields>
+        explicit
+        writer(boost::beast::http::message<isRequest, RequestBody, Fields>& msg)
+          : value_(msg.body())
+        {
+        }
+
+        void init(boost::optional<std::uint64_t> const&, boost::system::error_code& ec) {
+          ec.assign(0, ec.category());
+        }
+
+        template<class ConstBufferSequence>
+        std::size_t put(ConstBufferSequence const& buffers, boost::system::error_code& ec) {
+          auto size = boost::asio::buffer_copy(value_.buffers, buffers);
+          if (size == boost::asio::buffer_size(buffers))
+            ec.assign(0, ec.category());
+          else
+            ec = boost::beast::http::error::need_buffer;
+
+          value_.buffers.clear();
+          return size;
+        }
+
+        void
+        finish(boost::system::error_code& ec) {
+          ec.assign(0, ec.category());
+        }
+      };
+    };
+    
+    struct ResponseBody {
+      // BodyReader/BodyWriter were reversed for Boost release.
+#if BOOST_VERSION >= 106600
+      class writer;
+#else
+      class reader;
+#endif
+      class value_type : public std::string {
+        std::vector<boost::asio::const_buffer> buffers;
+        bool more;
+
+      public:
+        value_type()
+          : more(true) {
+        }
+
+        value_type& operator=(const std::string& s) {
+          std::string::operator=(s);
+          return *this;
+        }
+        
+        // BodyReader/BodyWriter were reversed for Boost release.
+#if BOOST_VERSION >= 106600
+        friend class ResponseBody::writer;
+#else
+        friend class ResponseBody::reader;
+#endif
+        friend class WebServer::Response;
+      };
   
+      // BodyReader/BodyWriter were reversed @ Boost 1.66.
+#if BOOST_VERSION >= 106600
+      class writer {
+#else
+      class reader {
+#endif
+        const value_type& value_;
+        bool toggle_;
+      public:
+        typedef std::vector<boost::asio::const_buffer> const_buffers_type;
+    
+        template<bool isRequest, class Fields>
+        explicit
+        // BodyReader/BodyWriter were reversed @ Boost 1.66.
+#if BOOST_VERSION >= 106600
+        writer(boost::beast::http::message<isRequest, ResponseBody, Fields>& msg)
+#else
+        reader(boost::beast::http::message<isRequest, ResponseBody, Fields>& msg)
+#endif
+          : value_(msg.body())
+          , toggle_(false) {
+        }
+
+        void init(boost::system::error_code& ec) {
+          ec.assign(0, ec.category());
+        }
+    
+        boost::optional<std::pair<const_buffers_type, bool>>
+        get(boost::system::error_code& ec) {
+          ec.assign(0, ec.category());
+          
+          const auto size = boost::asio::buffer_size(value_.buffers);
+          if (toggle_ || (value_.empty() && size == 0)) {
+            if (value_.more) {
+              toggle_ = false;
+              ec = boost::beast::http::error::need_buffer;
+            }
+            return boost::none;
+          }
+
+          // When data is returned with more=true, the serializer will
+          // call again without executing the handler. Arrange to return
+          // need_buffer on that second call to avoid an infinite loop (as
+          // buffer_body does).
+          toggle_ = true;
+          if (!value_.empty()) {
+            return std::pair<const_buffers_type, bool>(
+              const_buffers_type(1, boost::asio::buffer(value_)),
+              value_.more);
+          }
+          return std::pair<const_buffers_type, bool>(value_.buffers, value_.more);
+        }
+      };
+    };
+
+    struct ConstBufferContainer : public std::vector<boost::asio::const_buffer> {
+      ConstBufferContainer() = default;
+
+      template<typename T>
+      ConstBufferContainer(const T& buffers) {
+        for (const auto& buffer : buffers)
+          emplace_back(buffer);
+      }
+    };
+    
+    struct MutableBufferContainer : public std::vector<boost::asio::mutable_buffer> {
+      MutableBufferContainer() = default;
+
+      template<typename T>
+      MutableBufferContainer(const T& buffers) {
+        for (const auto& buffer : buffers)
+          emplace_back(buffer);
+      }
+    };
+    
+    struct StreamAdapter {
+      virtual boost::asio::io_service& get_io_service() = 0;
+
+      // AsyncWriteStream
+      virtual void async_write_some(
+        ConstBufferContainer buffers,
+        std::function<void(const boost::system::error_code&, std::size_t)> handler) = 0;
+
+      // AsyncReadStream
+      virtual void async_read_some(
+        MutableBufferContainer buffers,
+        std::function<void(const boost::system::error_code&, std::size_t)> handler) = 0;
+
+      // SyncWriteStream
+      virtual std::size_t write_some(
+        ConstBufferContainer buffers,
+        boost::system::error_code& ec) = 0;
+      virtual std::size_t write_some(ConstBufferContainer buffers) {
+        boost::system::error_code ec;
+        auto size = write_some(buffers, ec);
+        if (ec)
+          throw boost::system::system_error(ec);
+        return size;
+      }
+
+      // SyncReadStream
+      virtual std::size_t read_some(
+        MutableBufferContainer buffers,
+        boost::system::error_code& ec) = 0;
+      virtual std::size_t read_some(MutableBufferContainer buffers) {
+        boost::system::error_code ec;
+        auto size = read_some(buffers, ec);
+        if (ec)
+          throw boost::system::system_error(ec);
+        return size;
+      }
+    };
+
+    template<typename StreamType>
+    class StreamAdapterT : public StreamAdapter {
+      StreamType& stream_;
+    public:
+      StreamAdapterT(StreamType& stream)
+        : stream_(stream)
+      {
+      }
+
+      virtual boost::asio::io_service& get_io_service() {
+        return stream_.get_io_service();
+      }
+
+      virtual void async_write_some(
+        ConstBufferContainer buffers,
+        std::function<void(const boost::system::error_code&, std::size_t)> handler)
+      {
+        stream_.async_write_some(std::move(buffers), std::move(handler));
+      }
+
+      virtual void async_read_some(
+        MutableBufferContainer buffers,
+        std::function<void(const boost::system::error_code&, std::size_t)> handler)
+      {
+        stream_.async_read_some(std::move(buffers), std::move(handler));
+      }
+
+      virtual std::size_t write_some(
+        ConstBufferContainer buffers,
+        boost::system::error_code& ec)
+      {
+        return stream_.write_some(std::move(buffers), ec);
+      }
+
+      virtual std::size_t read_some(
+        MutableBufferContainer buffers,
+        boost::system::error_code& ec)
+      {
+        return stream_.read_some(std::move(buffers), ec);
+      }
+    };
+  } // namespace detail
+
+    // RequestParser with AsyncReadStream and SyncReadStream support.
   class Parser : public boost::beast::http::request_parser<detail::RequestBody> {
     std::unique_ptr<detail::StreamAdapter> stream_;
     boost::beast::flat_buffer& buffer_;
@@ -33,24 +274,23 @@ namespace WebServer {
       return stream_->get_io_service();
     }
 
+    // AsyncReadStream
     template<typename MutableBufferSequence, typename ReadHandler>
     void async_read_some(
       const MutableBufferSequence& buffers,
-      ReadHandler&& handler)
+      ReadHandler handler)
     {
       const auto buffersSize = boost::asio::buffer_size(buffers);
-      BOOST_LOG_TRIVIAL(info) << "async_read_some " << buffersSize;
       for (const auto& buffer : buffers)
         get().body().buffers.emplace_back(buffer);
 
-      async_read(
-        *stream_, buffer_, *this,
+      async_read(*stream_, buffer_, *this,
         [=](const boost::system::error_code& ec, std::size_t size) mutable {
-          BOOST_LOG_TRIVIAL(info) << "async_read handler " << ec.message() << " " << size;
           handler(ec, size);
         });
     }
 
+    // SyncReadStream
     template<typename MutableBufferSequence>
     std::size_t read_some(const MutableBufferSequence& buffers) {
       boost::system::error_code ec;
@@ -64,7 +304,6 @@ namespace WebServer {
       const MutableBufferSequence& buffers,
       boost::system::error_code& ec) {
       const auto buffersSize = boost::asio::buffer_size(buffers);
-      BOOST_LOG_TRIVIAL(info) << "read_some " << buffersSize;
       for (const auto& buffer : buffers)
         get().body().buffers.emplace_back(buffer);
 
@@ -101,7 +340,6 @@ namespace WebServer {
       WriteHandler&& handler)
     {
       const auto buffersSize = boost::asio::buffer_size(buffers);
-      BOOST_LOG_TRIVIAL(info) << "async_write_some " << buffersSize;
       for (const auto& buffer : buffers)
         body().buffers.emplace_back(buffer);
     
@@ -109,7 +347,6 @@ namespace WebServer {
         *stream_,
         serializer_,
         [=](boost::system::error_code ec, std::size_t size) mutable {
-          BOOST_LOG_TRIVIAL(info) << "async_write_some handler " << ec.message() << " " << size;
           if (!ec || ec == boost::beast::http::error::need_buffer) {
             body().buffers.clear();
             ec = {};
@@ -120,7 +357,6 @@ namespace WebServer {
 
     template<typename Token>
     auto async_finish(Token&& token) {
-      BOOST_LOG_TRIVIAL(info) << "async_finish";
 #if BOOST_VERSION >= 106600
       using result_type = typename boost::asio::async_result<std::decay_t<Token>, void(boost::system::error_code)>;
       typename result_type::completion_handler_type handler(std::forward<Token>(token));
@@ -138,7 +374,6 @@ namespace WebServer {
         *stream_,
         serializer_, 
         [=](boost::system::error_code ec, std::size_t size) mutable {
-          BOOST_LOG_TRIVIAL(info) << "async_finish handler " << size;
           handler(ec);
         });
     
@@ -160,7 +395,6 @@ namespace WebServer {
       boost::system::error_code & ec)
     {
       const auto buffersSize = boost::asio::buffer_size(buffers);
-      BOOST_LOG_TRIVIAL(info) << "write_some " << buffersSize;
       for (const auto& buffer : buffers)
         body().buffers.emplace_back(buffer);
     
@@ -261,7 +495,6 @@ namespace WebServer {
       const std::shared_ptr<Response>& response) const {
 
       if (!parser->is_done()) {
-        BOOST_LOG_TRIVIAL(debug) << "parser not done";
         static std::vector<char> flushBuffer(FLUSH_BLOCK_SIZE);
         async_read(
           *parser, boost::asio::buffer(flushBuffer),
@@ -281,7 +514,6 @@ namespace WebServer {
       response->async_finish(
         [=](const boost::system::error_code& ec) {
           boost::ignore_unused(response);
-          BOOST_LOG_TRIVIAL(info) << "async_finish handler " << ec.message();
           if (ec)
             fail(ec, "response completion");
         });
@@ -337,10 +569,10 @@ namespace WebServer {
     virtual void doResponse(
       Parser& parser,
       Response& response,
-      const std::function<void(const boost::system::error_code& ec)>& handler) const
+      const std::function<void(const boost::system::error_code& ec)>& complete) const
     {
       static const size_t CHUNK_SIZE = 8192;
-      static const size_t MAX_BODY_SIZE = 1048576;
+      static const size_t MAX_BODY_SIZE = 1 << 20;
       
       Request& request = parser.get();
       if (!parser.is_done()) {
@@ -354,39 +586,33 @@ namespace WebServer {
 
             request.body().insert(request.body().end(), v->begin(), v->begin() + size);
             if (request.body().size() < MAX_BODY_SIZE) {
-              doResponse(parser, response, handler);
+              doResponse(parser, response, complete);
             }
             else {
               if (!parser.is_done()) {
                 BOOST_LOG_TRIVIAL(warning) << boost::format("Body truncated to %d bytes")
                   % request.body().size();
               }
-              doResponse(request, response, handler);
+              doResponse(request, response, complete);
             }
           });
         return;
       }
 
-      doResponse(request, response, handler);
+      doResponse(request, response, complete);
     }
 
     // Override this function to get the request body as a string.
     virtual void doResponse(
       const Request& request,
       Response& response,
-      const std::function<void(const boost::system::error_code& ec)>& handler) const
+      const std::function<void(const boost::system::error_code& ec)>& complete) const
     {
       BOOST_LOG_TRIVIAL(info) << request.body();
       
       response.result(boost::beast::http::status::ok);
-
-      auto body = std::make_shared<std::string>("Hello, world!");
-      async_write(
-        response, boost::asio::buffer(*body),
-        [=](const boost::system::error_code& ec, std::size_t) {
-          boost::ignore_unused(body);
-          handler(ec);
-        });
+      response.body() = "Hello, world!";
+      complete(boost::system::error_code());
     }
   };
 

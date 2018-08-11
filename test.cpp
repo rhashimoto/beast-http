@@ -7,7 +7,7 @@ struct MyWebServer : public WebServer::BasicServer {
   virtual void doResponse(
     WebServer::Parser& parser,
     WebServer::Response& response,
-    const std::function<void(const boost::system::error_code& ec)>& handler) const
+    const std::function<void(const boost::system::error_code& ec)>& complete) const
     {
       response.result(boost::beast::http::status::ok);
       response.set(boost::beast::http::field::content_type, "text/plain");
@@ -16,7 +16,7 @@ struct MyWebServer : public WebServer::BasicServer {
         boost::asio::buffer("how now brown cow", 17),
         [=](const boost::system::error_code& ec, size_t size) {
           BOOST_LOG_TRIVIAL(info) << "async_write handler " << ec.message() << " " << size;
-          handler(ec);
+          complete(ec);
         });
     }
 };
