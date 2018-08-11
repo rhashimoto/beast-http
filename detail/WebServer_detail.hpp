@@ -1,5 +1,6 @@
 
 namespace WebServer {
+  class Parser;
   class Response;
   
   namespace detail {
@@ -12,12 +13,13 @@ namespace WebServer {
       class value_type {
         std::vector<boost::asio::mutable_buffer> buffers;
 
-      // BodyReader/BodyWriter were reversed @ Boost 1.66.
+        // BodyReader/BodyWriter were reversed @ Boost 1.66.
 #if BOOST_VERSION >= 106600
         friend class RequestBody::reader;
 #else
         friend class RequestBody::writer;
 #endif
+        friend class WebServer::Parser;
       };
 
       // BodyReader/BodyWriter were reversed @ Boost 1.66.
@@ -36,7 +38,7 @@ namespace WebServer {
         }
 
         void init(boost::optional<std::uint64_t> const&, boost::system::error_code& ec) {
-            ec.assign(0, ec.category());
+          ec.assign(0, ec.category());
         }
 
         template<class ConstBufferSequence>
@@ -46,6 +48,7 @@ namespace WebServer {
             ec.assign(0, ec.category());
           else
             ec = boost::beast::http::error::need_buffer;
+
           value_.buffers.clear();
           return size;
         }
@@ -73,12 +76,13 @@ namespace WebServer {
           : more(true) {
         }
 
-        friend class WebServer::Response;
+        // BodyReader/BodyWriter were reversed for Boost release.
 #if BOOST_VERSION >= 106600
         friend class ResponseBody::writer;
 #else
         friend class ResponseBody::reader;
 #endif
+        friend class WebServer::Response;
       };
   
       // BodyReader/BodyWriter were reversed @ Boost 1.66.
@@ -150,7 +154,7 @@ namespace WebServer {
       }
     };
     
-    struct StreamFacade {
+    struct StreamAdapter {
       virtual boost::asio::io_service& get_io_service() = 0;
 
       // AsyncWriteStream
@@ -189,10 +193,10 @@ namespace WebServer {
     };
 
     template<typename StreamType>
-    class StreamFacadeT : public StreamFacade {
+    class StreamAdapterT : public StreamAdapter {
       StreamType& stream_;
     public:
-      StreamFacadeT(StreamType& stream)
+      StreamAdapterT(StreamType& stream)
         : stream_(stream)
       {
       }

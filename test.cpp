@@ -1,11 +1,11 @@
 #include "WebServer.hpp"
 
-struct MyWebServer : public WebServer::BasicServer<WebServer::StringRequest> {
+struct MyWebServer : public WebServer::BasicServer {
   MyWebServer(boost::asio::io_service& io)
-    : WebServer::BasicServer<WebServer::StringRequest>(io) {}
+    : WebServer::BasicServer(io) {}
   
   virtual void doResponse(
-    const WebServer::StringRequest& request,
+    WebServer::Parser& parser,
     WebServer::Response& response,
     const std::function<void(const boost::system::error_code& ec)>& handler) const
     {
