@@ -13,8 +13,9 @@ namespace WebServer {
   class Parser;
   class Response;
   namespace detail {
-// BodyReader/BodyWriter were swapped @ Boost 1.66.
-#if BOOST_VERSION >= 106600
+// BodyReader/BodyWriter were swapped @ Boost Beast 132.
+// https://github.com/boostorg/beast/commit/895c9fa7ed79df27dca119d0395941045289e2a3    
+#if BOOST_BEAST_VERSION >= 132
 #define READER reader
 #define WRITER writer
 #else
@@ -42,14 +43,14 @@ namespace WebServer {
       class READER {
         value_type& value_;
       public:
-        // This constructor deprecated in Boost 1.66.
+#if BOOST_BEAST_VERSION < 150
         template<bool isRequest, class Fields>
         explicit
         READER(boost::beast::http::message<isRequest, RequestBody, Fields>& msg)
           : READER(msg.base(), msg.body())
         {
         }
-        
+#endif
         template<bool isRequest, class Fields>
         explicit
         READER(boost::beast::http::header<isRequest, Fields>&, value_type& value)
@@ -111,13 +112,13 @@ namespace WebServer {
       public:
         typedef std::vector<boost::asio::const_buffer> const_buffers_type;
     
-        // This constructor deprecated in Boost 1.66.
+#if BOOST_BEAST_VERSION < 150
         template<bool isRequest, class Fields>
         explicit
         WRITER(boost::beast::http::message<isRequest, ResponseBody, Fields>& msg)
           : WRITER(msg.base(), msg.body()) {
         }
-
+#endif
         template<bool isRequest, class Fields>
         explicit
         WRITER(boost::beast::http::header<isRequest, Fields>&, value_type& value)
