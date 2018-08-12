@@ -425,8 +425,7 @@ namespace WebServer {
     typedef std::function<void (Parser&, Response&, const CompletionHandler&)> RequestHandler;
 
     Session(Stream& stream)
-      : stream_(stream)
-      , flushBufferBytes_(DEFAULT_FLUSH_BUFFER_BYTES) {
+      : stream_(stream) {
     }
 
     // Two handlers must be provided. The request handler is called
@@ -445,68 +444,69 @@ namespace WebServer {
     static const std::size_t DEFAULT_FLUSH_BUFFER_BYTES = 8192;
     
     Stream& stream_;
-    boost::beast::flat_buffer parseBuffer_;
-    
     RequestHandler handle_;
     CompletionHandler complete_;
 
-    std::size_t flushBufferBytes_;
+    // Parsing requires a single buffer for all requests on the
+    // stream.
+    boost::beast::flat_buffer parseBuffer_;
 
+    // Per-request state.
+    boost::optional<Parser> parser_;
+    boost::optional<Response> response_;
+    
     // Create the request parser and parse the header.
     void beginTransaction() {
-      auto parser = std::make_shared<Parser>(stream_, parseBuffer_);
+      parser_.emplace(stream_, parseBuffer_);
       boost::beast::http::async_read_header(
-        stream_, parseBuffer_, *parser,
+        stream_, parseBuffer_, parser_.get(),
         [=](const boost::system::error_code& ec, size_t) mutable {
           if (ec) {
             if (ec != boost::beast::http::error::end_of_stream)
               fail(ec, "parse header");
             return close(ec);
           }
-          invokeHandler(parser);
+          invokeHandler();
         });
     }
 
     // Create the response and invoke the handler callback.
-    void invokeHandler(const std::shared_ptr<Parser>& parser) {
+    void invokeHandler() {
       BOOST_LOG_TRIVIAL(info) << boost::format("%x %s %s")
         % &stream_
-        % parser->get().method_string()
-        % parser->get().target();
-      auto response = std::make_shared<Response>(stream_);
-      response->version(parser->get().version());
-      response->set(boost::beast::http::field::server, BOOST_BEAST_VERSION_STRING);
-      response->keep_alive(parser->get().keep_alive());
-      response->prepare_payload();
+        % parser_.get().get().method_string()
+        % parser_.get().get().target();
+      response_.emplace(stream_);
+      response_.get().version(parser_.get().get().version());
+      response_.get().set(boost::beast::http::field::server, BOOST_BEAST_VERSION_STRING);
+      response_.get().keep_alive(parser_.get().get().keep_alive());
+      response_.get().prepare_payload();
 
       handle_(
-        *parser, *response,
+        parser_.get(), response_.get(),
         [=](const boost::system::error_code& ec) mutable {
           if (ec) {
             fail(ec, "user handler");
             return close(ec);
           }
-          endTransaction(parser, response);
+          endTransaction();
         });
     }
 
     // Complete request input and response output.
-    void endTransaction(
-      const std::shared_ptr<Parser>& parser,
-      const std::shared_ptr<Response>& response)
+    void endTransaction()
     {
-      if (!parser->is_done()) {
+      if (!parser_.get().is_done()) {
         // Flush the unread request body data.
-        static std::vector<char> flushBuffer;
-        flushBuffer.resize(flushBufferBytes_);
+        static std::vector<char> flushBuffer(DEFAULT_FLUSH_BUFFER_BYTES);
         
         return async_read(
-          *parser, boost::asio::buffer(flushBuffer),
+          parser_.get(), boost::asio::buffer(flushBuffer),
           [=](const boost::system::error_code& ec, std::size_t size) mutable {
             if (!ec ||
                 ec == boost::beast::http::error::need_buffer ||
                 ec == boost::asio::error::eof) {
-              endTransaction(parser, response);
+              endTransaction();
             }
             else {
               fail(ec, "parser flush");
@@ -514,12 +514,11 @@ namespace WebServer {
             }
           });
       }
+      parser_ = boost::none;
       
-      response->async_finish(
+      response_.get().async_finish(
         [=](const boost::system::error_code& ec) mutable {
-          // This capture extends the lifetime of the Request to this
-          // point.
-          boost::ignore_unused(response);
+          response_ = boost::none;
           if (ec)
             fail(ec, "response completion");
           beginTransaction();
