@@ -13,7 +13,7 @@ namespace WebServer {
   class Parser;
   class Response;
   namespace detail {
-    // BodyReader/BodyWriter were reversed @ Boost 1.66.
+// BodyReader/BodyWriter were swapped @ Boost 1.66.
 #if BOOST_VERSION >= 106600
 #define READER reader
 #define WRITER writer
@@ -21,24 +21,32 @@ namespace WebServer {
 #define READER writer
 #define WRITER reader
 #endif
-    
+
+    // Implementation of boost::beast Body concept:
+    // https://www.boost.org/doc/libs/1_68_0/libs/beast/doc/html/beast/concepts/Body.html
     struct RequestBody {
       class READER;
+
+      // Subclass value_type from std::string to allow both a simple
+      // handler that can access pre-parsed body data or a handler
+      // that reads its own boday.data.
       class value_type : public std::string {
         std::vector<boost::asio::mutable_buffer> buffers;
         
-        friend class RequestBody::READER;
+        friend class READER;
         friend class WebServer::Parser;
       };
 
+      // Implementation of boost::beast BodyReader concept:
+      // https://www.boost.org/doc/libs/1_68_0/libs/beast/doc/html/beast/concepts/BodyReader.html
       class READER {
         value_type& value_;
       public:
-        // Deprecated in Boost 1.66.
+        // This constructor deprecated in Boost 1.66.
         template<bool isRequest, class Fields>
         explicit
         READER(boost::beast::http::message<isRequest, RequestBody, Fields>& msg)
-          : value_(msg.body())
+          : READER(msg.base(), msg.body())
         {
         }
         
@@ -71,8 +79,14 @@ namespace WebServer {
       };
     };
     
+    // Implementation of boost::beast Body concept:
+    // https://www.boost.org/doc/libs/1_68_0/libs/beast/doc/html/beast/concepts/Body.html
     struct ResponseBody {
       class WRITER;
+
+      // Subclass from std::string so the handler can choose between
+      // setting the entire body as a string or writing body data to
+      // the Response.
       class value_type : public std::string {
         std::vector<boost::asio::const_buffer> buffers;
         bool more;
@@ -87,7 +101,7 @@ namespace WebServer {
           return *this;
         }
         
-        friend class ResponseBody::WRITER;
+        friend class WRITER;
         friend class WebServer::Response;
       };
   
@@ -97,12 +111,11 @@ namespace WebServer {
       public:
         typedef std::vector<boost::asio::const_buffer> const_buffers_type;
     
-        // Deprecated in Boost 1.66.
+        // This constructor deprecated in Boost 1.66.
         template<bool isRequest, class Fields>
         explicit
         WRITER(boost::beast::http::message<isRequest, ResponseBody, Fields>& msg)
-          : value_(msg.body())
-          , toggle_(false) {
+          : WRITER(msg.base(), msg.body()) {
         }
 
         template<bool isRequest, class Fields>
@@ -145,28 +158,27 @@ namespace WebServer {
     };
 #undef READER
 #undef WRITER
-    
-    struct ConstBufferContainer : public std::vector<boost::asio::const_buffer> {
-      ConstBufferContainer() = default;
+
+    // This implements boost::asio ConstBufferSequence so StreamAdapter can
+    // have virtual non-template methods.
+    template<typename BufferType>
+    struct BufferContainer : public std::vector<BufferType> {
+      BufferContainer() = default;
 
       template<typename T>
-      ConstBufferContainer(const T& buffers) {
+      BufferContainer(const T& buffers) {
         for (const auto& buffer : buffers)
-          emplace_back(buffer);
+          this->emplace_back(buffer);
       }
     };
-    
-    struct MutableBufferContainer : public std::vector<boost::asio::mutable_buffer> {
-      MutableBufferContainer() = default;
 
-      template<typename T>
-      MutableBufferContainer(const T& buffers) {
-        for (const auto& buffer : buffers)
-          emplace_back(buffer);
-      }
-    };
-    
+    // Type-erasure adapter so Response can have a stream reference
+    // without being a template class. This allows user handlers to be
+    // written independently of the stream providing i/o.
     struct StreamAdapter {
+      typedef BufferContainer<boost::asio::const_buffer> ConstBufferContainer;
+      typedef BufferContainer<boost::asio::mutable_buffer> MutableBufferContainer;
+      
       virtual boost::asio::io_service& get_io_service() = 0;
 
       // AsyncWriteStream
@@ -247,7 +259,8 @@ namespace WebServer {
     };
   } // namespace detail
 
-    // RequestParser with AsyncReadStream and SyncReadStream support.
+  // RequestParser with AsyncReadStream and SyncReadStream support.
+  // User handlers can read request body data from the Parser.
   class Parser : public boost::beast::http::request_parser<detail::RequestBody> {
     std::unique_ptr<detail::StreamAdapter> stream_;
     boost::beast::flat_buffer& buffer_;
@@ -308,10 +321,37 @@ namespace WebServer {
 
   typedef Parser::value_type Request;
   
-  // Response with AsyncWriteStream and SyncWriteStream support.
+  // Response with AsyncWriteStream and SyncWriteStream support. User
+  // handlers can write response body data to the Response.
+  template<typename Stream> class Session;
   class Response : public boost::beast::http::response<detail::ResponseBody> {
     std::unique_ptr<detail::StreamAdapter> stream_;
     boost::beast::http::response_serializer<body_type, fields_type> serializer_;
+
+    template<typename T> friend class Session;
+    template<typename Token>
+    auto async_finish(Token&& token) {
+#if BOOST_VERSION >= 106600
+      using result_type = typename boost::asio::async_result<std::decay_t<Token>, void(boost::system::error_code)>;
+      typename result_type::completion_handler_type handler(std::forward<Token>(token));
+
+      result_type result(handler);
+#else
+      typename boost::asio::handler_type<Token, void(boost::system::error_code)>::type
+        handler(std::forward<Token>(token));
+
+      boost::asio::async_result<decltype (handler)> result (handler);
+#endif
+
+      body().more = false;
+      async_write(
+        *stream_, serializer_, 
+        [=](boost::system::error_code ec, std::size_t size) mutable {
+          handler(ec);
+        });
+    
+      return result.get();
+    }
 
   public:
     template<typename Stream>
@@ -326,6 +366,7 @@ namespace WebServer {
       return stream_->get_io_service();
     }
 
+    // AsyncWriteStream
     template<typename ConstBufferSequence, typename WriteHandler>
     void async_write_some(
       const ConstBufferSequence& buffers,
@@ -347,31 +388,7 @@ namespace WebServer {
         });
     }
 
-    template<typename Token>
-    auto async_finish(Token&& token) {
-#if BOOST_VERSION >= 106600
-      using result_type = typename boost::asio::async_result<std::decay_t<Token>, void(boost::system::error_code)>;
-      typename result_type::completion_handler_type handler(std::forward<Token>(token));
-
-      result_type result(handler);
-#else
-      typename boost::asio::handler_type<Token, void(boost::system::error_code)>::type
-        handler(std::forward<Token>(token));
-
-      boost::asio::async_result<decltype (handler)> result (handler);
-#endif
-
-      body().more = false;
-      async_write(
-        *stream_,
-        serializer_, 
-        [=](boost::system::error_code ec, std::size_t size) mutable {
-          handler(ec);
-        });
-    
-      return result.get();
-    }
-
+    // SyncWriteStream
     template<typename ConstBufferSequence>
     std::size_t write_some(const ConstBufferSequence& buffers) {
       boost::system::error_code ec;
@@ -380,7 +397,6 @@ namespace WebServer {
         throw boost::system::system_error(ec);
       return result;
     }
- 
     template<typename ConstBufferSequence>
     std::size_t write_some(
       const ConstBufferSequence& buffers,
@@ -399,6 +415,8 @@ namespace WebServer {
     }
   };
 
+  // This class encapsulates a session, i.e. a stream connection that
+  // may include multiple requests.
   template<typename Stream>
   class Session {
   public:
@@ -410,6 +428,9 @@ namespace WebServer {
       , flushBufferBytes_(DEFAULT_FLUSH_BUFFER_BYTES) {
     }
 
+    // Two handlers must be provided. The request handler is called
+    // for each request in the session. The completion handler is
+    // called once at the conclusion of the session.
     void start(RequestHandler handle, CompletionHandler complete) {
       handle_ = std::move(handle);
       complete_ = std::move(complete);
@@ -417,6 +438,9 @@ namespace WebServer {
     }
 
   private:
+    // After the user handler is done, any unread request body data is
+    // read and discarded. This parameter defines the buffer size for
+    // these discarded reads.
     static const std::size_t DEFAULT_FLUSH_BUFFER_BYTES = 8192;
     
     Stream& stream_;
@@ -471,6 +495,7 @@ namespace WebServer {
       const std::shared_ptr<Response>& response)
     {
       if (!parser->is_done()) {
+        // Flush the unread request body data.
         static std::vector<char> flushBuffer;
         flushBuffer.resize(flushBufferBytes_);
         
@@ -491,6 +516,8 @@ namespace WebServer {
       
       response->async_finish(
         [=](const boost::system::error_code& ec) mutable {
+          // This capture extends the lifetime of the Request to this
+          // point.
           boost::ignore_unused(response);
           if (ec)
             fail(ec, "response completion");
@@ -508,10 +535,9 @@ namespace WebServer {
     }
     
   };
-      
+
+  // Simple unencrypted example server.
   class BasicServer {
-    static const std::size_t FLUSH_BUFFER_SIZE = 16384;
-    
     boost::asio::io_service& io_;
     boost::asio::ip::tcp::acceptor acceptor_;
 
@@ -551,7 +577,8 @@ namespace WebServer {
           handleRequest(parser, response, complete);
         },
         [=](const boost::system::error_code& ec) {
-          // Force capture to extend the lifetime of the Session.
+          // This capture extends the lifetime of the Session to this
+          // point.
           boost::ignore_unused(session);
           endConnection(socket);
         });
@@ -657,4 +684,3 @@ namespace WebServer {
 }
 
 #endif // WebServer_H_
-  
