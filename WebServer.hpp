@@ -13,39 +13,41 @@ namespace WebServer {
   class Parser;
   class Response;
   namespace detail {
-    struct RequestBody {
+    // BodyReader/BodyWriter were reversed @ Boost 1.66.
 #if BOOST_VERSION >= 106600
-      class reader;
+#define READER reader
+#define WRITER writer
 #else
-      class writer;
+#define READER writer
+#define WRITER reader
 #endif
+    
+    struct RequestBody {
+      class READER;
       class value_type : public std::string {
         std::vector<boost::asio::mutable_buffer> buffers;
         
-        // BodyReader/BodyWriter were reversed @ Boost 1.66.
-#if BOOST_VERSION >= 106600
-        friend class RequestBody::reader;
-#else
-        friend class RequestBody::writer;
-#endif
+        friend class RequestBody::READER;
         friend class WebServer::Parser;
       };
 
-      // BodyReader/BodyWriter were reversed @ Boost 1.66.
-#if BOOST_VERSION >= 106600
-      class reader {
-#else
-      class writer {
-#endif
+      class READER {
         value_type& value_;
       public:
+        // Deprecated in Boost 1.66.
         template<bool isRequest, class Fields>
         explicit
-        writer(boost::beast::http::message<isRequest, RequestBody, Fields>& msg)
+        READER(boost::beast::http::message<isRequest, RequestBody, Fields>& msg)
           : value_(msg.body())
         {
         }
-
+        
+        template<bool isRequest, class Fields>
+        explicit
+        READER(boost::beast::http::header<isRequest, Fields>&, value_type& value)
+          : value_(value) {
+        }
+        
         void init(boost::optional<std::uint64_t> const&, boost::system::error_code& ec) {
           ec.assign(0, ec.category());
         }
@@ -70,12 +72,7 @@ namespace WebServer {
     };
     
     struct ResponseBody {
-      // BodyReader/BodyWriter were reversed for Boost release.
-#if BOOST_VERSION >= 106600
-      class writer;
-#else
-      class reader;
-#endif
+      class WRITER;
       class value_type : public std::string {
         std::vector<boost::asio::const_buffer> buffers;
         bool more;
@@ -90,35 +87,28 @@ namespace WebServer {
           return *this;
         }
         
-        // BodyReader/BodyWriter were reversed for Boost release.
-#if BOOST_VERSION >= 106600
-        friend class ResponseBody::writer;
-#else
-        friend class ResponseBody::reader;
-#endif
+        friend class ResponseBody::WRITER;
         friend class WebServer::Response;
       };
   
-      // BodyReader/BodyWriter were reversed @ Boost 1.66.
-#if BOOST_VERSION >= 106600
-      class writer {
-#else
-      class reader {
-#endif
+      class WRITER {
         const value_type& value_;
         bool toggle_;
       public:
         typedef std::vector<boost::asio::const_buffer> const_buffers_type;
     
+        // Deprecated in Boost 1.66.
         template<bool isRequest, class Fields>
         explicit
-        // BodyReader/BodyWriter were reversed @ Boost 1.66.
-#if BOOST_VERSION >= 106600
-        writer(boost::beast::http::message<isRequest, ResponseBody, Fields>& msg)
-#else
-        reader(boost::beast::http::message<isRequest, ResponseBody, Fields>& msg)
-#endif
+        WRITER(boost::beast::http::message<isRequest, ResponseBody, Fields>& msg)
           : value_(msg.body())
+          , toggle_(false) {
+        }
+
+        template<bool isRequest, class Fields>
+        explicit
+        WRITER(boost::beast::http::header<isRequest, Fields>&, value_type& value)
+          : value_(value)
           , toggle_(false) {
         }
 
@@ -153,7 +143,9 @@ namespace WebServer {
         }
       };
     };
-
+#undef READER
+#undef WRITER
+    
     struct ConstBufferContainer : public std::vector<boost::asio::const_buffer> {
       ConstBufferContainer() = default;
 
@@ -434,7 +426,8 @@ namespace WebServer {
     CompletionHandler complete_;
 
     std::size_t flushBufferBytes_;
-    
+
+    // Create the request parser and parse the header.
     void beginTransaction() {
       auto parser = std::make_shared<Parser>(stream_, parseBuffer_);
       boost::beast::http::async_read_header(
@@ -449,6 +442,7 @@ namespace WebServer {
         });
     }
 
+    // Create the response and invoke the handler callback.
     void invokeHandler(const std::shared_ptr<Parser>& parser) {
       BOOST_LOG_TRIVIAL(info) << boost::format("%x %s %s")
         % &stream_
@@ -471,6 +465,7 @@ namespace WebServer {
         });
     }
 
+    // Complete request input and response output.
     void endTransaction(
       const std::shared_ptr<Parser>& parser,
       const std::shared_ptr<Response>& response)
@@ -502,8 +497,9 @@ namespace WebServer {
           beginTransaction();
         });
     }
-    
-    void close(const boost::system::error_code& ec) {
+
+    // Invoke the completion callback.
+    void close(const boost::system::error_code& ec) const {
       complete_(ec);
     }
 
@@ -551,17 +547,17 @@ namespace WebServer {
       beginConnection();
       auto session = std::make_shared<Session<Stream>>(*socket);
       session->start(
-        [=](Parser& parser, Response& response, const Session<Stream>::CompletionHandler& complete) mutable {
+        [=](Parser& parser, Response& response, const Session<Stream>::CompletionHandler& complete) {
           handleRequest(parser, response, complete);
         },
-        [=](const boost::system::error_code& ec) mutable {
-          // TODO: Do something on error?
+        [=](const boost::system::error_code& ec) {
+          // Force capture to extend the lifetime of the Session.
           boost::ignore_unused(session);
           endConnection(socket);
         });
     }
 
-    void endConnection(const std::shared_ptr<Stream>& socket) {
+    void endConnection(const std::shared_ptr<Stream>& socket) const {
       boost::system::error_code ec;
       auto endpoint = socket->remote_endpoint(ec);
       if (!ec) {
