@@ -1,8 +1,13 @@
 #include "WebServer.hpp"
 
 struct MyWebServer : public WebServer::BasicServer {
+#if BOOST_VERSION >= 106600
+  MyWebServer(boost::asio::io_context& io)
+    : WebServer::BasicServer(io) {}
+#else
   MyWebServer(boost::asio::io_service& io)
     : WebServer::BasicServer(io) {}
+#endif
   
   virtual void handleRequest(
     const WebServer::Request& request,
@@ -24,7 +29,11 @@ struct MyWebServer : public WebServer::BasicServer {
 };
 
 int main() {
+#if BOOST_VERSION >= 106600
+  boost::asio::io_context io;
+#else
   boost::asio::io_service io;
+#endif
   MyWebServer server(io);
 
   server.start("0.0.0.0", 8080);

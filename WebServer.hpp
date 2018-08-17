@@ -1,7 +1,13 @@
 #ifndef WebServer_H_
 #define WebServer_H_
 
+#include <boost/version.hpp>
+#if BOOST_VERSION >= 106600
+#include <boost/asio/executor.hpp>
+#include <boost/asio/io_context.hpp>
+#else
 #include <boost/asio/io_service.hpp>
+#endif
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/streambuf.hpp>
@@ -168,9 +174,18 @@ namespace WebServer {
 
       template<typename T>
       BufferContainer(const T& buffers) {
+#if BOOST_VERSION >= 106600
+        for (auto i = boost::asio::buffer_sequence_begin(buffers);
+             i != boost::asio::buffer_sequence_end(buffers);
+             ++i) {
+          this->emplace_back(*i);
+        }
+      }
+#else
         for (const auto& buffer : buffers)
           this->emplace_back(buffer);
       }
+#endif
     };
 
     // Type-erasure adapter so Response can have a stream reference
@@ -179,16 +194,42 @@ namespace WebServer {
     struct StreamAdapter {
       typedef BufferContainer<boost::asio::const_buffer> ConstBufferContainer;
       typedef BufferContainer<boost::asio::mutable_buffer> MutableBufferContainer;
-      
+
+      template<typename MutableBufferSequence,
+               typename ReadHandler>
+      void async_read_some(const MutableBufferSequence& buffers, ReadHandler&& handler) {
+        auto handlerPtr = std::make_shared<ReadHandler>(std::move(handler));
+        async_read_some_forward(
+          MutableBufferContainer(buffers),
+          [=](const boost::system::error_code& ec, std::size_t size) {
+            (*handlerPtr)(ec, size);
+          });
+      }
+
+      template<typename ConstBufferSequence,
+               typename WriteHandler>
+      void async_write_some(const ConstBufferSequence& buffers, WriteHandler&& handler) {
+        auto handlerPtr = std::make_shared<WriteHandler>(std::move(handler));
+        async_write_some_forward(
+          ConstBufferContainer(buffers),
+          [=](const boost::system::error_code& ec, std::size_t size) {
+            (*handlerPtr)(ec, size);
+          });
+      }
+
+#if BOOST_VERSION >= 106600
+      virtual boost::asio::executor get_executor() = 0;
+#else      
       virtual boost::asio::io_service& get_io_service() = 0;
 
+#endif
       // AsyncWriteStream
-      virtual void async_write_some(
+      virtual void async_write_some_forward(
         ConstBufferContainer buffers,
         std::function<void(const boost::system::error_code&, std::size_t)> handler) = 0;
 
       // AsyncReadStream
-      virtual void async_read_some(
+      virtual void async_read_some_forward(
         MutableBufferContainer buffers,
         std::function<void(const boost::system::error_code&, std::size_t)> handler) = 0;
 
@@ -221,23 +262,30 @@ namespace WebServer {
     class StreamAdapterT : public StreamAdapter {
       StreamType& stream_;
     public:
+      explicit
       StreamAdapterT(StreamType& stream)
         : stream_(stream)
       {
       }
 
+#if BOOST_VERSION >= 106600
+      virtual boost::asio::executor get_executor() {
+        return stream_.get_executor();
+      }
+#else
       virtual boost::asio::io_service& get_io_service() {
         return stream_.get_io_service();
       }
-
-      virtual void async_write_some(
+#endif
+      
+      virtual void async_write_some_forward(
         ConstBufferContainer buffers,
         std::function<void(const boost::system::error_code&, std::size_t)> handler)
       {
         stream_.async_write_some(std::move(buffers), std::move(handler));
       }
 
-      virtual void async_read_some(
+      virtual void async_read_some_forward(
         MutableBufferContainer buffers,
         std::function<void(const boost::system::error_code&, std::size_t)> handler)
       {
@@ -268,6 +316,7 @@ namespace WebServer {
     
   public:
     template<typename Stream>
+    explicit
     Parser(Stream& stream, boost::beast::flat_buffer& buffer)
       : boost::beast::http::request_parser<detail::RequestBody>()
       , stream_(new detail::StreamAdapterT<Stream>(stream))
@@ -275,11 +324,16 @@ namespace WebServer {
     {
     }
 
-    boost::asio::io_service&
-    get_io_service() {
+#if BOOST_VERSION >= 106600
+    boost::asio::executor get_executor() {
+      return stream_->get_executor();
+    }
+#else    
+    boost::asio::io_service& get_io_service() {
       return stream_->get_io_service();
     }
-
+#endif
+    
     // AsyncReadStream
     template<typename MutableBufferSequence, typename ReadHandler>
     void async_read_some(
@@ -287,12 +341,21 @@ namespace WebServer {
       ReadHandler handler)
     {
       const auto buffersSize = boost::asio::buffer_size(buffers);
+#if BOOST_VERSION >= 106600
+      for (auto i = boost::asio::buffer_sequence_begin(buffers);
+           i != boost::asio::buffer_sequence_end(buffers);
+           ++i) {
+        get().body().buffers.emplace_back(*i);
+      }
+#else
       for (const auto& buffer : buffers)
         get().body().buffers.emplace_back(buffer);
+#endif
 
+      auto handlerPtr = std::make_shared<ReadHandler>(std::move(handler));
       async_read(*stream_, buffer_, *this,
         [=](const boost::system::error_code& ec, std::size_t size) mutable {
-          handler(ec, size);
+          (*handlerPtr)(ec, size);
         });
     }
 
@@ -329,44 +392,38 @@ namespace WebServer {
     std::unique_ptr<detail::StreamAdapter> stream_;
     boost::beast::http::response_serializer<body_type, fields_type> serializer_;
 
-    template<typename T> friend class Session;
-    template<typename Token>
-    auto async_finish(Token&& token) {
-#if BOOST_VERSION >= 106600
-      using result_type = typename boost::asio::async_result<std::decay_t<Token>, void(boost::system::error_code)>;
-      typename result_type::completion_handler_type handler(std::forward<Token>(token));
-
-      result_type result(handler);
-#else
-      typename boost::asio::handler_type<Token, void(boost::system::error_code)>::type
-        handler(std::forward<Token>(token));
-
-      boost::asio::async_result<decltype (handler)> result (handler);
-#endif
-
+    template<typename Handler>
+    void async_finish(Handler&& handler) {
       body().more = false;
       async_write(
         *stream_, serializer_, 
-        [=](boost::system::error_code ec, std::size_t size) mutable {
+        [=, handler=std::move(handler)](boost::system::error_code ec, std::size_t size) mutable {
           handler(ec);
         });
-    
-      return result.get();
     }
 
+    template<typename Stream>
+    friend class Session;
   public:
     template<typename Stream>
+    explicit
     Response(Stream& stream)
       : boost::beast::http::response<detail::ResponseBody>()
       , stream_(new detail::StreamAdapterT<Stream>(stream))
       , serializer_(*this) {
     }
 
+#if BOOST_VERSION >= 106600
+    boost::asio::executor get_executor() {
+      return stream_->get_executor();
+    }
+#else    
     boost::asio::io_service&
     get_io_service() {
       return stream_->get_io_service();
     }
-
+#endif
+    
     // AsyncWriteStream
     template<typename ConstBufferSequence, typename WriteHandler>
     void async_write_some(
@@ -376,7 +433,8 @@ namespace WebServer {
       const auto buffersSize = boost::asio::buffer_size(buffers);
       for (const auto& buffer : buffers)
         body().buffers.emplace_back(buffer);
-    
+
+      auto handlerPtr = std::make_shared<WriteHandler>(std::move(handler));
       async_write(
         *stream_,
         serializer_,
@@ -385,7 +443,7 @@ namespace WebServer {
             body().buffers.clear();
             ec = {};
           }
-          handler(ec, size);
+          (*handlerPtr)(ec, size);
         });
     }
 
@@ -424,6 +482,7 @@ namespace WebServer {
     typedef std::function<void (const boost::system::error_code&)> CompletionHandler;
     typedef std::function<void (Parser&, Response&, const CompletionHandler&)> RequestHandler;
 
+    explicit
     Session(Stream& stream)
       : stream_(stream) {
     }
@@ -538,7 +597,11 @@ namespace WebServer {
 
   // Simple unencrypted example server.
   class BasicServer {
+#if BOOST_VERSION >= 106600
+    boost::asio::io_context& io_;
+#else    
     boost::asio::io_service& io_;
+#endif
     boost::asio::ip::tcp::acceptor acceptor_;
 
     typedef boost::asio::ip::tcp::socket Stream;
@@ -602,11 +665,18 @@ namespace WebServer {
     }
 
   public:
+#if BOOST_VERSION >= 106600
+    BasicServer(boost::asio::io_context& io)
+      : io_(io)
+      , acceptor_(io) {
+    }
+#else
     BasicServer(boost::asio::io_service& io)
       : io_(io)
       , acceptor_(io) {
     }
-
+#endif
+    
     virtual ~BasicServer() = default;
     
     virtual void start(const std::string& address, unsigned short port = 8080) {
