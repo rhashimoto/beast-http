@@ -340,7 +340,6 @@ namespace WebServer {
       const MutableBufferSequence& buffers,
       ReadHandler handler)
     {
-      const auto buffersSize = boost::asio::buffer_size(buffers);
 #if BOOST_VERSION >= 106600
       for (auto i = boost::asio::buffer_sequence_begin(buffers);
            i != boost::asio::buffer_sequence_end(buffers);
@@ -372,7 +371,6 @@ namespace WebServer {
     std::size_t read_some(
       const MutableBufferSequence& buffers,
       boost::system::error_code& ec) {
-      const auto buffersSize = boost::asio::buffer_size(buffers);
       for (const auto& buffer : buffers)
         get().body().buffers.emplace_back(buffer);
 
@@ -430,7 +428,6 @@ namespace WebServer {
       const ConstBufferSequence& buffers,
       WriteHandler&& handler)
     {
-      const auto buffersSize = boost::asio::buffer_size(buffers);
       for (const auto& buffer : buffers)
         body().buffers.emplace_back(buffer);
 
