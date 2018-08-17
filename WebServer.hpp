@@ -226,12 +226,12 @@ namespace WebServer {
       // AsyncWriteStream
       virtual void async_write_some_forward(
         ConstBufferContainer buffers,
-        std::function<void(const boost::system::error_code&, std::size_t)> handler) = 0;
+        std::function<void(const boost::system::error_code&, std::size_t)>&& handler) = 0;
 
       // AsyncReadStream
       virtual void async_read_some_forward(
         MutableBufferContainer buffers,
-        std::function<void(const boost::system::error_code&, std::size_t)> handler) = 0;
+        std::function<void(const boost::system::error_code&, std::size_t)>&& handler) = 0;
 
       // SyncWriteStream
       virtual std::size_t write_some(
@@ -280,14 +280,14 @@ namespace WebServer {
       
       virtual void async_write_some_forward(
         ConstBufferContainer buffers,
-        std::function<void(const boost::system::error_code&, std::size_t)> handler)
+        std::function<void(const boost::system::error_code&, std::size_t)>&& handler)
       {
         stream_.async_write_some(std::move(buffers), std::move(handler));
       }
 
       virtual void async_read_some_forward(
         MutableBufferContainer buffers,
-        std::function<void(const boost::system::error_code&, std::size_t)> handler)
+        std::function<void(const boost::system::error_code&, std::size_t)>&& handler)
       {
         stream_.async_read_some(std::move(buffers), std::move(handler));
       }
