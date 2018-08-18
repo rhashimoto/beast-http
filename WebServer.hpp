@@ -782,6 +782,12 @@ namespace WebServer {
     }
 
     virtual void stop() {
+      boost::system::error_code ec;
+      acceptor_.cancel(ec);
+      if (ec) {
+        BOOST_LOG_TRIVIAL(error) << boost::format("acceptor cancel error: %s")
+          % ec.message();
+      }
     }
 
     // Override this function to control reading the request body.

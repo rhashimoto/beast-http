@@ -1,3 +1,5 @@
+#include <boost/asio/signal_set.hpp>
+
 #include "WebServer.hpp"
 
 struct MyWebServer : public WebServer::BasicServer {
@@ -35,8 +37,16 @@ int main() {
   boost::asio::io_service io;
 #endif
   MyWebServer server(io);
-
   server.start("0.0.0.0", 8080);
+
+  boost::asio::signal_set signals(io, SIGINT, SIGTERM);
+  signals.async_wait([&](const boost::system::error_code& ec, int signal_number) {
+    if (!ec) {
+      BOOST_LOG_TRIVIAL(info) << boost::format("signal %d") % signal_number;
+      server.stop();
+    }
+  });
+  
   io.run();
   
   return 0;
