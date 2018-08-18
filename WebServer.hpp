@@ -253,17 +253,33 @@ namespace WebServer {
       template<typename MutableBufferSequence,
                typename ReadHandler>
       void async_read_some(const MutableBufferSequence& buffers, ReadHandler&& handler) {
+        // Select type erasure wrapper (MovableHandler or
+        // std::function) based on whether the handler can be move
+        // constructed.
+        typedef typename std::conditional<
+          std::is_move_constructible<ReadHandler>::value,
+          TransferHandler,
+          std::function<void(const boost::system::error_code&, std::size_t)>>::type
+          TypeErasedHandler;
         async_read_some_forward(
           MutableBufferContainer(buffers),
-          TransferHandler{std::forward<ReadHandler>(handler)});
+          TypeErasedHandler{std::forward<ReadHandler>(handler)});
       }
 
       template<typename ConstBufferSequence,
                typename WriteHandler>
       void async_write_some(const ConstBufferSequence& buffers, WriteHandler&& handler) {
+        // Select type erasure wrapper (MovableHandler or
+        // std::function) based on whether the handler can be move
+        // constructed.
+        typedef typename std::conditional<
+          std::is_move_constructible<WriteHandler>::value,
+          TransferHandler,
+          std::function<void(const boost::system::error_code&, std::size_t)>>::type
+          TypeErasedHandler;
         async_write_some_forward(
           ConstBufferContainer(buffers),
-          TransferHandler(std::forward<WriteHandler>(handler)));
+          TypeErasedHandler(std::forward<WriteHandler>(handler)));
       }
 
 #if BOOST_VERSION >= 106600
@@ -276,11 +292,17 @@ namespace WebServer {
       virtual void async_write_some_forward(
         ConstBufferContainer buffers,
         TransferHandler&& handler) = 0;
+      virtual void async_write_some_forward(
+        ConstBufferContainer buffers,
+        std::function<void(const boost::system::error_code&, std::size_t)>&& handler) = 0;
 
       // AsyncReadStream
       virtual void async_read_some_forward(
         MutableBufferContainer buffers,
         TransferHandler&& handler) = 0;
+      virtual void async_read_some_forward(
+        MutableBufferContainer buffers,
+        std::function<void(const boost::system::error_code&, std::size_t)>&& handler) = 0;
 
       // SyncWriteStream
       virtual std::size_t write_some(
@@ -329,14 +351,26 @@ namespace WebServer {
       
       virtual void async_write_some_forward(
         ConstBufferContainer buffers,
-        TransferHandler&& handler)
+        TransferHandler&& handler) override
       {
         stream_.async_write_some(std::move(buffers), std::move(handler));
       }
+      virtual void async_write_some_forward(
+        ConstBufferContainer buffers,
+        std::function<void(const boost::system::error_code&, std::size_t)>&& handler) override
+      {
+        stream_.async_write_some(std::move(buffers), std::move(handler));
+      }    
 
       virtual void async_read_some_forward(
         MutableBufferContainer buffers,
         TransferHandler&& handler) override
+      {
+        stream_.async_read_some(std::move(buffers), std::move(handler));
+      }
+      virtual void async_read_some_forward(
+        MutableBufferContainer buffers,
+        std::function<void(const boost::system::error_code&, std::size_t)>&& handler) override
       {
         stream_.async_read_some(std::move(buffers), std::move(handler));
       }
