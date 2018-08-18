@@ -786,15 +786,17 @@ namespace WebServer {
       
       Request& request = parser.get();
       if (!parser.is_done()) {
-        auto v = std::make_shared<std::vector<char>>(
-          std::min(MAX_BODY_SIZE - request.body().size(), CHUNK_SIZE));
+        std::vector<char> v(std::min(MAX_BODY_SIZE - request.body().size(), CHUNK_SIZE));
+        auto buffer = boost::asio::buffer(v.data(), v.size());
         async_read(
-          parser, boost::asio::buffer(*v),
-          [=, &parser, &request, &response](const boost::system::error_code& ec, std::size_t size) mutable {
+          parser, buffer,
+          [=, v(std::move(v)), &parser, &request, &response](
+            const boost::system::error_code& ec, std::size_t size) mutable
+          {
             // Work around https://github.com/boostorg/beast/issues/1223
-            size = ec == boost::beast::http::error::need_buffer ? v->size() : size;
+            size = ec == boost::beast::http::error::need_buffer ? v.size() : size;
 
-            request.body().insert(request.body().end(), v->begin(), v->begin() + size);
+            request.body().insert(request.body().end(), v.begin(), v.begin() + size);
             if (request.body().size() < MAX_BODY_SIZE) {
               handleRequest(parser, response, complete);
             }
