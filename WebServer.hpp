@@ -265,7 +265,7 @@ namespace WebServer {
         // std::function) based on whether the handler can be move
         // constructed.
         typedef typename std::conditional<
-          std::is_rvalue_reference<ReadHandler>::value && std::is_move_constructible<ReadHandler>::value,
+          std::is_move_constructible<ReadHandler>::value,
           TransferHandler,
           std::function<void(const boost::system::error_code&, std::size_t)>>::type
           TypeErasedHandler;
@@ -281,7 +281,7 @@ namespace WebServer {
         // std::function) based on whether the handler can be move
         // constructed.
         typedef typename std::conditional<
-          std::is_rvalue_reference<WriteHandler>::value && std::is_move_constructible<WriteHandler>::value,
+          std::is_move_constructible<WriteHandler>::value,
           TransferHandler,
           std::function<void(const boost::system::error_code&, std::size_t)>>::type
           TypeErasedHandler;
