@@ -218,6 +218,7 @@ namespace WebServer {
       std::unique_ptr<Holder> h_;
 
     public:
+      MovableHandler() = default;
       MovableHandler(MovableHandler&& other) = default;
 
       template<typename Functor,
@@ -226,7 +227,14 @@ namespace WebServer {
       MovableHandler(Functor&& f)
         : h_{new HolderT<typename std::decay<Functor>::type>{std::forward<Functor>(f)}} {
       }
-
+      template<typename Functor,
+               typename = typename std::enable_if<
+                 std::is_convertible<std::result_of_t<Functor(Args...)>, Result>::value>::type>
+      MovableHandler& operator=(Functor&& f) {
+        h_.reset(new HolderT<typename std::decay<Functor>::type>{std::forward<Functor>(f)});
+        return *this;
+      }
+      
       // Copy constructor and assignment are invalid and not used at
       // runtime, but must exist to pass boost/asio static assertion
       // checks in Boost 1.62.
@@ -556,7 +564,6 @@ namespace WebServer {
   class Session {
   public:
     typedef std::function<void (const boost::system::error_code&)> CompletionHandler;
-    typedef std::function<void (Parser&, Response&, const CompletionHandler&)> RequestHandler;
 
     explicit
     Session(Stream& stream)
@@ -566,7 +573,10 @@ namespace WebServer {
     // Two handlers must be provided. The request handler is called
     // for each request in the session. The completion handler is
     // called once at the conclusion of the session.
-    void start(RequestHandler handle, CompletionHandler complete) {
+    void start(
+      detail::MovableHandler<void(Parser&, Response&, const CompletionHandler&)>&& handle,
+      detail::MovableHandler<void(const boost::system::error_code&)>&& complete)
+    {
       handle_ = std::move(handle);
       complete_ = std::move(complete);
       beginTransaction();
@@ -579,8 +589,8 @@ namespace WebServer {
     static const std::size_t DEFAULT_FLUSH_BUFFER_BYTES = 8192;
     
     Stream& stream_;
-    RequestHandler handle_;
-    CompletionHandler complete_;
+    detail::MovableHandler<void(Parser&, Response&, const CompletionHandler&)> handle_;
+    detail::MovableHandler<void(const boost::system::error_code&)> complete_;
 
     // Parsing requires a single buffer for all requests on the
     // stream.
@@ -709,12 +719,13 @@ namespace WebServer {
       }
 
       beginConnection();
-      auto session = std::make_shared<Session<Stream>>(*socket);
-      session->start(
+      auto session = std::make_unique<Session<Stream>>(*socket);
+      auto sptr = session.get();
+      sptr->start(
         [=](Parser& parser, Response& response, const Session<Stream>::CompletionHandler& complete) {
           handleRequest(parser, response, complete);
         },
-        [=](const boost::system::error_code& ec) {
+        [=, session(std::move(session))](const boost::system::error_code& ec) {
           // This capture extends the lifetime of the Session to this
           // point.
           boost::ignore_unused(session);
