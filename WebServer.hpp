@@ -191,6 +191,58 @@ namespace WebServer {
 #endif
     };
 
+    // Type-erased movable handler.
+    template<typename T> class MovableHandler;
+    template<typename Result, typename... Args>
+    class MovableHandler<Result(Args...)> {
+    private:
+      struct Holder {
+        virtual Result operator()(Args...) = 0;
+      };
+
+      template<typename T>
+      class HolderT : public Holder {
+        T t_;
+      public:
+        HolderT(HolderT&& other) = default;
+
+        template<typename U>
+        HolderT(U&& u) : t_{std::forward<U>(u)} {
+        }
+        
+        Result operator()(Args... a) override {
+          t_(std::forward<Args>(a)...);
+        }
+      };
+
+      std::unique_ptr<Holder> h_;
+
+    public:
+      MovableHandler(MovableHandler&& other) = default;
+
+      template<typename Functor,
+               typename = typename std::enable_if<
+                 std::is_convertible<std::result_of_t<Functor(Args...)>, Result>::value>::type>
+      MovableHandler(Functor&& f)
+        : h_{new HolderT<typename std::decay<Functor>::type>{std::forward<Functor>(f)}} {
+      }
+
+      // Copy constructor and assignment are invalid and not used at
+      // runtime, but must exist to pass boost/asio static assertion
+      // checks in Boost 1.62.
+      MovableHandler(const MovableHandler&) {
+        throw std::logic_error("MovableHandler is not copyable");
+      }
+      MovableHandler& operator=(const MovableHandler&) {
+        throw std::logic_error("MovableHandler is not copyable");
+      }
+
+      Result operator()(Args... args) const {
+        return (*h_)(std::forward<Args>(args)...);
+      }
+    };
+    typedef MovableHandler<void(const boost::system::error_code&, std::size_t)> TransferHandler;
+
     // Type-erasure adapter so Response can have a stream reference
     // without being a template class. This allows user handlers to be
     // written independently of the stream providing i/o.
@@ -198,63 +250,12 @@ namespace WebServer {
       typedef BufferContainer<boost::asio::const_buffer> ConstBufferContainer;
       typedef BufferContainer<boost::asio::mutable_buffer> MutableBufferContainer;
 
-      // Type-erased movable handler.
-      template<typename T> class MovableHandler;
-      template<typename Result, typename... Args>
-      class MovableHandler<Result(Args...)> {
-      private:
-        struct Holder {
-          virtual Result operator()(Args...) = 0;
-        };
-
-        template<typename T>
-        class HolderT : public Holder {
-          T t_;
-        public:
-          template<typename U>
-          HolderT(U&& u) : t_{std::forward<U>(u)} {
-          }
-
-          Result operator()(Args... a) override {
-            t_(std::forward<Args>(a)...);
-          }
-        };
-
-        std::unique_ptr<Holder> h_;
-
-      public:
-        MovableHandler(MovableHandler&& other) = default;
-        
-        template<typename Functor,
-                 typename = typename std::enable_if<
-                   std::is_convertible<std::result_of_t<Functor(Args...)>, Result>::value>::type>
-        MovableHandler(Functor&& f)
-          : h_{new HolderT<typename std::decay<Functor>::type>{std::forward<Functor>(f)}} {
-        }
-
-        // Copy constructor and assignment are invalid and not used at
-        // runtime, but must exist to pass boost/asio static assertion
-        // checks in Boost 1.62.
-        MovableHandler(const MovableHandler&) {
-          throw std::logic_error("MovableHandler is not copyable");
-        }
-        MovableHandler& operator=(const MovableHandler&) {
-          throw std::logic_error("MovableHandler is not copyable");
-        }
-        
-        Result operator()(Args... args) const {
-          return (*h_)(std::forward<Args>(args)...);
-        }
-      };
-
-      typedef MovableHandler<void(const boost::system::error_code&, std::size_t)> TransferHandler;
-      
       template<typename MutableBufferSequence,
                typename ReadHandler>
       void async_read_some(const MutableBufferSequence& buffers, ReadHandler&& handler) {
         async_read_some_forward(
           MutableBufferContainer(buffers),
-          TransferHandler{std::move(handler)});
+          TransferHandler{std::forward<ReadHandler>(handler)});
       }
 
       template<typename ConstBufferSequence,
@@ -262,7 +263,7 @@ namespace WebServer {
       void async_write_some(const ConstBufferSequence& buffers, WriteHandler&& handler) {
         async_write_some_forward(
           ConstBufferContainer(buffers),
-          TransferHandler(std::move(handler)));
+          TransferHandler(std::forward<WriteHandler>(handler)));
       }
 
 #if BOOST_VERSION >= 106600
@@ -386,7 +387,7 @@ namespace WebServer {
     template<typename MutableBufferSequence, typename ReadHandler>
     void async_read_some(
       const MutableBufferSequence& buffers,
-      ReadHandler handler)
+      ReadHandler&& handler)
     {
 #if BOOST_VERSION >= 106600
       for (auto i = boost::asio::buffer_sequence_begin(buffers);
@@ -399,11 +400,9 @@ namespace WebServer {
         get().body().buffers.emplace_back(buffer);
 #endif
 
-      auto handlerPtr = std::make_shared<ReadHandler>(std::move(handler));
-      async_read(*stream_, buffer_, *this,
-        [=](const boost::system::error_code& ec, std::size_t size) mutable {
-          (*handlerPtr)(ec, size);
-        });
+      async_read(
+        *stream_, buffer_, *this,
+        detail::TransferHandler(std::forward<ReadHandler>(handler)));
     }
 
     // SyncReadStream
@@ -479,10 +478,9 @@ namespace WebServer {
       for (const auto& buffer : buffers)
         body().buffers.emplace_back(buffer);
 
-      auto handlerPtr = std::make_shared<WriteHandler>(std::move(handler));
+      auto handlerPtr = std::make_shared<WriteHandler>(std::forward<WriteHandler>(handler));
       async_write(
-        *stream_,
-        serializer_,
+        *stream_, serializer_,
         [=](boost::system::error_code ec, std::size_t size) mutable {
           if (!ec || ec == boost::beast::http::error::need_buffer) {
             body().buffers.clear();
