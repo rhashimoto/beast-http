@@ -400,9 +400,9 @@ namespace WebServer {
         get().body().buffers.emplace_back(buffer);
 #endif
 
-      async_read(
+      boost::beast::http::async_read(
         *stream_, buffer_, *this,
-        detail::TransferHandler(std::forward<ReadHandler>(handler)));
+        std::forward<ReadHandler>(handler));
     }
 
     // SyncReadStream
@@ -441,10 +441,8 @@ namespace WebServer {
     void async_finish(Handler&& handler) {
       body().more = false;
       async_write(
-        *stream_, serializer_, 
-        [=, handler=std::move(handler)](boost::system::error_code ec, std::size_t size) mutable {
-          handler(ec);
-        });
+        *stream_, serializer_,
+        std::forward<Handler>(handler));
     }
 
     template<typename Stream>
@@ -478,16 +476,17 @@ namespace WebServer {
       for (const auto& buffer : buffers)
         body().buffers.emplace_back(buffer);
 
-      auto handlerPtr = std::make_shared<WriteHandler>(std::forward<WriteHandler>(handler));
-      async_write(
+      boost::beast::http::async_write(
         *stream_, serializer_,
-        [=](boost::system::error_code ec, std::size_t size) mutable {
-          if (!ec || ec == boost::beast::http::error::need_buffer) {
-            body().buffers.clear();
-            ec = {};
-          }
-          (*handlerPtr)(ec, size);
-        });
+        [this, handler(std::forward<WriteHandler>(handler))](
+            boost::system::error_code ec, std::size_t size) mutable
+         {
+           if (!ec || ec == boost::beast::http::error::need_buffer) {
+             body().buffers.clear();
+             ec = {};
+           }
+           handler(ec, size);
+         });
     }
 
     // SyncWriteStream
@@ -619,7 +618,7 @@ namespace WebServer {
       parser_ = boost::none;
       
       response_.get().async_finish(
-        [=](const boost::system::error_code& ec) mutable {
+        [=](const boost::system::error_code& ec, std::size_t) mutable {
           response_ = boost::none;
           if (ec)
             fail(ec, "response completion");
@@ -635,7 +634,6 @@ namespace WebServer {
     void fail(const boost::system::error_code& ec, const std::string& context) const {
       BOOST_LOG_TRIVIAL(error) << context << ": " << ec.message();
     }
-    
   };
 
   // Simple unencrypted example server.
