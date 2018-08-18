@@ -1,6 +1,9 @@
 #ifndef WebServer_H_
 #define WebServer_H_
 
+#include <stdexcept>
+#include <vector>
+
 #include <boost/version.hpp>
 #if BOOST_VERSION >= 106600
 #include <boost/asio/executor.hpp>
@@ -195,43 +198,88 @@ namespace WebServer {
       typedef BufferContainer<boost::asio::const_buffer> ConstBufferContainer;
       typedef BufferContainer<boost::asio::mutable_buffer> MutableBufferContainer;
 
+      // Type-erased movable handler.
+      template<typename T> class MovableHandler;
+      template<typename Result, typename... Args>
+      class MovableHandler<Result(Args...)> {
+      private:
+        struct Holder {
+          virtual Result operator()(Args...) = 0;
+        };
+
+        template<typename T>
+        class HolderT : public Holder {
+          T t_;
+        public:
+          template<typename U>
+          HolderT(U&& u) : t_{std::forward<U>(u)} {
+          }
+
+          Result operator()(Args... a) override {
+            t_(std::forward<Args>(a)...);
+          }
+        };
+
+        std::unique_ptr<Holder> h_;
+
+      public:
+        MovableHandler(MovableHandler&& other) = default;
+        
+        template<typename Functor,
+                 typename = typename std::enable_if<
+                   std::is_convertible<std::result_of_t<Functor(Args...)>, Result>::value>::type>
+        MovableHandler(Functor&& f)
+          : h_{new HolderT<typename std::decay<Functor>::type>{std::forward<Functor>(f)}} {
+        }
+
+        // Copy constructor and assignment are invalid and not used at
+        // runtime, but must exist to pass boost/asio static assertion
+        // checks in Boost 1.62.
+        MovableHandler(const MovableHandler&) {
+          throw std::logic_error("MovableHandler is not copyable");
+        }
+        MovableHandler& operator=(const MovableHandler&) {
+          throw std::logic_error("MovableHandler is not copyable");
+        }
+        
+        Result operator()(Args... args) const {
+          return (*h_)(std::forward<Args>(args)...);
+        }
+      };
+
+      typedef MovableHandler<void(const boost::system::error_code&, std::size_t)> TransferHandler;
+      
       template<typename MutableBufferSequence,
                typename ReadHandler>
       void async_read_some(const MutableBufferSequence& buffers, ReadHandler&& handler) {
-        auto handlerPtr = std::make_shared<ReadHandler>(std::move(handler));
         async_read_some_forward(
           MutableBufferContainer(buffers),
-          [=](const boost::system::error_code& ec, std::size_t size) {
-            (*handlerPtr)(ec, size);
-          });
+          TransferHandler{std::move(handler)});
       }
 
       template<typename ConstBufferSequence,
                typename WriteHandler>
       void async_write_some(const ConstBufferSequence& buffers, WriteHandler&& handler) {
-        auto handlerPtr = std::make_shared<WriteHandler>(std::move(handler));
         async_write_some_forward(
           ConstBufferContainer(buffers),
-          [=](const boost::system::error_code& ec, std::size_t size) {
-            (*handlerPtr)(ec, size);
-          });
+          TransferHandler(std::move(handler)));
       }
 
 #if BOOST_VERSION >= 106600
       virtual boost::asio::executor get_executor() = 0;
 #else      
       virtual boost::asio::io_service& get_io_service() = 0;
-
 #endif
+      
       // AsyncWriteStream
       virtual void async_write_some_forward(
         ConstBufferContainer buffers,
-        std::function<void(const boost::system::error_code&, std::size_t)>&& handler) = 0;
+        TransferHandler&& handler) = 0;
 
       // AsyncReadStream
       virtual void async_read_some_forward(
         MutableBufferContainer buffers,
-        std::function<void(const boost::system::error_code&, std::size_t)>&& handler) = 0;
+        TransferHandler&& handler) = 0;
 
       // SyncWriteStream
       virtual std::size_t write_some(
@@ -280,14 +328,14 @@ namespace WebServer {
       
       virtual void async_write_some_forward(
         ConstBufferContainer buffers,
-        std::function<void(const boost::system::error_code&, std::size_t)>&& handler)
+        TransferHandler&& handler)
       {
         stream_.async_write_some(std::move(buffers), std::move(handler));
       }
 
       virtual void async_read_some_forward(
         MutableBufferContainer buffers,
-        std::function<void(const boost::system::error_code&, std::size_t)>&& handler)
+        TransferHandler&& handler) override
       {
         stream_.async_read_some(std::move(buffers), std::move(handler));
       }
